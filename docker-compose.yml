@@ -1,0 +1,25 @@
+services:
+  whisper-mcp-server:
+    image: ghcr.io/mbay-odw/whisper-mcp-server:latest
+    container_name: whisper-mcp-server
+    restart: unless-stopped
+    environment:
+      - LOG_LEVEL=INFO
+      - MCP_TRANSPORT=sse
+      - PORT=8000
+      # Backend
+      - WHISPER_URL=http://whisper-service:5000
+      - WHISPER_BEARER=${WHISPER_BEARER}
+      # Auth
+      - MCP_API_KEY=${MCP_API_KEY}
+      - OIDC_INTROSPECTION_URL=${OIDC_INTROSPECTION_URL:-https://authelia.${DOMAIN}/api/oidc/introspection}
+      - OIDC_CLIENT_ID=whisper-mcp
+      - OIDC_CLIENT_SECRET=${OIDC_CLIENT_SECRET}
+    expose:
+      - "8000"
+    networks:
+      - traefik
+
+networks:
+  traefik:
+    external: true
