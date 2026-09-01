@@ -282,16 +282,26 @@ def _run_sse() -> None:
     oidc_client_id = os.getenv("OIDC_CLIENT_ID", "")
     oidc_client_secret = os.getenv("OIDC_CLIENT_SECRET", "")
 
-    async def _is_authorized(request: Request) -> tuple[bool, str | None]:
-        if not mcp_api_key:
-            return True, None
+    # Refuse to start rather than serve everything unauthenticated: an empty
+    # MCP_API_KEY is the image default, so a forgotten env var used to be enough to
+    # open the server to anyone. Failing loudly at startup is the only variant of
+    # this that cannot go unnoticed.
+    if not mcp_api_key and not all(
+        (oidc_introspection_url, oidc_client_id, oidc_client_secret)
+    ):
+        raise RuntimeError(
+            "[auth] Neither MCP_API_KEY nor a complete OIDC triple "
+            "(OIDC_INTROSPECTION_URL + OIDC_CLIENT_ID + OIDC_CLIENT_SECRET) is set. "
+            "Refusing to start."
+        )
 
+    async def _is_authorized(request: Request) -> tuple[bool, str | None]:
         auth = request.headers.get("Authorization", "")
         if not auth:
             return False, "no_header"
 
         # 1. Statischer Bearer (Claude Desktop)
-        if auth == f"Bearer {mcp_api_key}":
+        if mcp_api_key and auth == f"Bearer {mcp_api_key}":
             return True, None
 
         if not auth.startswith("Bearer "):
@@ -345,6 +355,17 @@ def _run_sse() -> None:
             )
         return Response()
 
+    async def handle_messages(scope, receive, send):
+        """The /messages/ endpoint carries the client's JSON-RPC calls for an SSE
+        session, so it needs the same check as every other route -- mounting
+        SseServerTransport.handle_post_message directly bypasses _is_authorized."""
+        req = Request(scope, receive=receive)
+        ok, reason = await _is_authorized(req)
+        if not ok:
+            await _unauthorized(reason)(scope, receive, send)
+            return
+        await sse.handle_post_message(scope, receive, send)
+
     class _AlreadySent(Response):
         def __init__(self) -> None:
             super().__init__(content=b"", status_code=200)
@@ -378,7 +399,7 @@ def _run_sse() -> None:
             Route("/sse", endpoint=handle_streamable_http, methods=["POST"]),
             Route("/mcp", endpoint=handle_streamable_http, methods=["POST"]),
             Route("/sse", endpoint=handle_sse, methods=["GET"]),
-            Mount("/messages/", app=sse.handle_post_message),
+            Mount("/messages/", app=handle_messages),
         ],
         lifespan=lifespan,
     )
