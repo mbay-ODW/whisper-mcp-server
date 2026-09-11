@@ -132,48 +132,22 @@ async def transcribe_from_url(
 async def search_transcripts(
     query: str, limit: int = 20
 ) -> list[dict[str, Any]]:
-    """Naive Volltextsuche über alle Done-Jobs.
+    """Volltextsuche über alle Transkripte.
 
-    Wir holen die Job-Liste, ziehen für die done-Jobs jeweils das Transkript
-    und filtern lokal nach `query` (case-insensitive substring).
+    Läuft serverseitig direkt über die Dateien auf der Platte. Früher lief das
+    über ``/api/jobs`` plus einen Detail-Request pro Job — das fand nichts,
+    sobald der Job-Index nach einem Restart leer war, und war ein N+1.
     """
     _check_config()
-    q = query.lower().strip()
+    q = query.strip()
     if not q:
         return []
 
     async with httpx.AsyncClient(timeout=60) as client:
-        # Job-Liste
-        resp = await client.get(f"{WHISPER_URL}/api/jobs", headers=_headers())
+        resp = await client.get(
+            f"{WHISPER_URL}/api/transcripts/search",
+            params={"q": q, "limit": limit},
+            headers=_headers(),
+        )
         resp.raise_for_status()
-        jobs = [j for j in resp.json() if j.get("status") == "done"]
-
-        hits: list[dict[str, Any]] = []
-        for job in jobs:
-            if len(hits) >= limit:
-                break
-            detail_resp = await client.get(
-                f"{WHISPER_URL}/api/jobs/{job['id']}", headers=_headers()
-            )
-            if detail_resp.status_code != 200:
-                continue
-            detail = detail_resp.json()
-            text = (detail.get("full_text") or "").lower()
-            if q in text:
-                # Snippet um den Treffer extrahieren
-                idx = text.find(q)
-                start = max(0, idx - 80)
-                end = min(len(text), idx + len(q) + 80)
-                snippet = (detail.get("full_text") or "")[start:end]
-                hits.append(
-                    {
-                        "id": detail["id"],
-                        "filename": detail.get("filename"),
-                        "created_at": detail.get("created_at"),
-                        "duration": detail.get("duration"),
-                        "snippet": ("…" if start > 0 else "")
-                        + snippet
-                        + ("…" if end < len(text) else ""),
-                    }
-                )
-        return hits
+        return resp.json()
