@@ -10,9 +10,10 @@ import logging
 import os
 from typing import Any
 
-import mcp.server.stdio
+import jsonschema
 import mcp.types as types
-from mcp.server import Server
+from mcp.server import Server, ServerRequestContext
+from mcp.server.stdio import stdio_server
 
 _log_level = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
@@ -22,28 +23,11 @@ logging.basicConfig(
 
 from . import client  # noqa: E402
 
-server = Server(
-    "whisper-mcp-server",
-    instructions=(
-        "MCP-Server für den selbst gehosteten Whisper-Transkriptions-Service.\n\n"
-        "Use cases:\n"
-        "- Recent Jobs auflisten / Status prüfen → whisper_list_jobs\n"
-        "- Transkript-Text fürs LLM-Kontextfenster holen → whisper_get_transcript_text\n"
-        "- Inhaltliche Suche über alle Done-Jobs → whisper_search_transcripts\n"
-        "- Audio von HTTPS-URL transkribieren lassen (GitHub-Gist, Release, …)"
-        " → whisper_transcribe_from_url. So funktioniert Upload aus Cowork-Sandbox,"
-        " die nur GitHub erreicht: Audio auf GitHub legen, URL übergeben.\n"
-        "- Jobs verwalten: cancel / retry / delete."
-    ),
-)
-
-
 # ---------------------------------------------------------------------------
 # Tool-Definitionen
 # ---------------------------------------------------------------------------
 
 
-@server.list_tools()
 async def list_tools() -> list[types.Tool]:
     return [
         types.Tool(
@@ -52,7 +36,7 @@ async def list_tools() -> list[types.Tool]:
                 "Listet die letzten Transkriptions-Jobs (neueste zuerst) mit Status, "
                 "Dateiname, Dauer und Modell. Optional Anzahl begrenzen."
             ),
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "limit": {
@@ -69,7 +53,7 @@ async def list_tools() -> list[types.Tool]:
                 "Vollständige Details zu einem Job inkl. Transkript-Text und "
                 "Zeitstempel-Segmenten."
             ),
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "job_id": {"type": "string", "description": "UUID des Jobs"}
@@ -83,7 +67,7 @@ async def list_tools() -> list[types.Tool]:
                 "Liefert NUR den reinen Transkript-Text eines Jobs ohne Meta — "
                 "optimal um ihn in den LLM-Kontext zu laden."
             ),
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "job_id": {"type": "string", "description": "UUID des Jobs"}
@@ -98,7 +82,7 @@ async def list_tools() -> list[types.Tool]:
                 "Gibt Treffer mit Snippet zurück. Geeignet zum Auffinden bestimmter "
                 "Notizen, Themen oder Stichwörter."
             ),
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "query": {
@@ -125,7 +109,7 @@ async def list_tools() -> list[types.Tool]:
                 "die Raw-URL einsetzen. Der MCP-Server pullt die Datei und "
                 "reicht sie an whisper-service durch."
             ),
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "url": {
@@ -158,7 +142,7 @@ async def list_tools() -> list[types.Tool]:
         types.Tool(
             name="whisper_cancel_job",
             description="Bricht einen laufenden oder wartenden Job ab.",
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {"job_id": {"type": "string"}},
                 "required": ["job_id"],
@@ -167,7 +151,7 @@ async def list_tools() -> list[types.Tool]:
         types.Tool(
             name="whisper_retry_job",
             description="Startet einen fehlgeschlagenen oder abgebrochenen Job neu.",
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {"job_id": {"type": "string"}},
                 "required": ["job_id"],
@@ -176,7 +160,7 @@ async def list_tools() -> list[types.Tool]:
         types.Tool(
             name="whisper_delete_job",
             description="Löscht einen Job permanent (inkl. Audiodatei falls noch vorhanden).",
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {"job_id": {"type": "string"}},
                 "required": ["job_id"],
@@ -188,7 +172,7 @@ async def list_tools() -> list[types.Tool]:
                 "Liefert die Liste der verfügbaren Whisper-Modelle "
                 "(built-in + Custom-HuggingFace) plus das Default-Modell."
             ),
-            inputSchema={"type": "object", "properties": {}},
+            input_schema={"type": "object", "properties": {}},
         ),
     ]
 
@@ -198,7 +182,6 @@ async def list_tools() -> list[types.Tool]:
 # ---------------------------------------------------------------------------
 
 
-@server.call_tool()
 async def call_tool(
     name: str, arguments: dict[str, Any]
 ) -> list[types.TextContent]:
@@ -254,13 +237,68 @@ async def _dispatch(name: str, args: dict[str, Any]) -> Any:
 # ---------------------------------------------------------------------------
 
 
+async def _on_list_tools(
+    ctx: ServerRequestContext, params: types.PaginatedRequestParams | None
+) -> types.ListToolsResult:
+    return types.ListToolsResult(tools=await list_tools())
+
+
+def _error_result(text: str) -> types.CallToolResult:
+    return types.CallToolResult(
+        content=[types.TextContent(type="text", text=text)], is_error=True
+    )
+
+
+async def _on_call_tool(
+    ctx: ServerRequestContext, params: types.CallToolRequestParams
+) -> types.CallToolResult:
+    """mcp 2.x prueft Argumente nicht mehr und wandelt Exceptions nicht mehr um."""
+    arguments = params.arguments or {}
+    tool = next((t for t in await list_tools() if t.name == params.name), None)
+    if tool is not None:
+        try:
+            jsonschema.validate(arguments, tool.input_schema)
+        except jsonschema.ValidationError as exc:
+            return _error_result(f"Input validation error: {exc.message}")
+    try:
+        content = await call_tool(params.name, arguments)
+    except Exception as exc:
+        return _error_result(str(exc))
+    return types.CallToolResult(content=content, is_error=False)
+
+
+server = Server(
+    "whisper-mcp-server",
+    instructions=(
+        "MCP-Server für den selbst gehosteten Whisper-Transkriptions-Service.\n\n"
+        "Use cases:\n"
+        "- Recent Jobs auflisten / Status prüfen → whisper_list_jobs\n"
+        "- Transkript-Text fürs LLM-Kontextfenster holen → whisper_get_transcript_text\n"
+        "- Inhaltliche Suche über alle Done-Jobs → whisper_search_transcripts\n"
+        "- Audio von HTTPS-URL transkribieren lassen (GitHub-Gist, Release, …)"
+        " → whisper_transcribe_from_url. So funktioniert Upload aus Cowork-Sandbox,"
+        " die nur GitHub erreicht: Audio auf GitHub legen, URL übergeben.\n"
+        "- Jobs verwalten: cancel / retry / delete."
+    ),
+    on_list_tools=_on_list_tools,
+    on_call_tool=_on_call_tool,
+)
+
+
 def main() -> None:
     import asyncio
 
     if os.getenv("MCP_TRANSPORT", "stdio") == "sse":
         _run_sse()
     else:
-        asyncio.run(mcp.server.stdio.run_server(server))
+        asyncio.run(_run_stdio())
+
+
+async def _run_stdio() -> None:
+    async with stdio_server() as (read_stream, write_stream):
+        await server.run(
+            read_stream, write_stream, server.create_initialization_options()
+        )
 
 
 def _run_sse() -> None:
